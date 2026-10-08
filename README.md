@@ -192,10 +192,8 @@ Skills de cette config (dans `~/.pi/agent/skills/`) :
 `langfuse`, `mongodb-atlas-stream-processing`, `mongodb-connection`,
 `mongodb-mcp-setup`, `mongodb-natural-language-querying`,
 `mongodb-query-optimizer`, `mongodb-schema-design`, `mongodb-search-and-ai`,
-`multica-*` (agent, autopilots, daemon, env, issues, runtime, squads, workspace),
 `n8n-*` (code JS/Python, expression-syntax, mcp-tools-expert, node-configuration,
-validation-expert, workflow-patterns), `pdf-reader`, `remotion`, `web-debug`,
-`youtube-transcript`.
+validation-expert, workflow-patterns), `pdf-reader`, `remotion`, `web-debug`.
 
 Skills partagés (dans `~/.agents/skills/`) : `brand-guidelines`, `canvas-design`,
 `postiz`.
