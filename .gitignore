@@ -1,0 +1,19 @@
+# Secrets et configuration locale — ne jamais committer
+auth.json
+mcp.json
+trust.json
+mcp.log
+mcp-cache.json
+mcp-npx-cache.json
+mcp-onboarding.json
+mcp-project-approvals.json
+models-store.json
+sessions/
+**/pi-langfuse/config.json
+**/web-search/auth.json
+*.uri
+*.bak
+*.bak.*
+.DS_Store
+node_modules/
+.venv/

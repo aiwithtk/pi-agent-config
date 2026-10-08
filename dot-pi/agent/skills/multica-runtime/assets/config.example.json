@@ -1,0 +1,31 @@
+{
+  "server_url": "http://localhost:8080",
+  "app_url": "http://localhost:3000",
+  "pat": "pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "runtimes": [
+    {
+      "id": "rt_ollama_llama3",
+      "name": "Llama3 (Ollama)",
+      "tool": "multica-llm-runtime",
+      "version": "0.1.0",
+      "status": "online",
+      "config": {
+        "llm": "ollama:llama3",
+        "env": {}
+      },
+      "last_heartbeat": "2026-05-13T10:22:33Z"
+    },
+    {
+      "id": "rt_openai_gpt4o",
+      "name": "GPT-4o (OpenAI)",
+      "tool": "multica-llm-runtime",
+      "version": "0.1.0",
+      "status": "online",
+      "config": {
+        "llm": "openai:gpt-4o",
+        "env": {"OPENAI_API_KEY": "sk-..."}
+      },
+      "last_heartbeat": "2026-05-13T10:22:33Z"
+    }
+  ]
+}

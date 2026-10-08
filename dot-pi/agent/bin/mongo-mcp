@@ -1,0 +1,40 @@
+#!/bin/sh
+# mongo-mcp — lance le serveur MCP MongoDB avec une URI lue dans le Trousseau macOS.
+#
+#   mongo-mcp <service-trousseau> [options du serveur MCP...]
+#   mongo-mcp pi-mongod-local-agent
+#   mongo-mcp pi-mongodb-atlas --readOnly
+#
+# Aucun mot de passe ne doit être écrit en clair dans ~/.pi/agent/mcp.json.
+# Récupérer l'URI : security find-generic-password -s <service> -w
+set -e
+
+SERVICE="$1"
+shift
+
+if [ -z "$SERVICE" ]; then
+  echo "mongo-mcp: usage: mongo-mcp <service-trousseau> [args...]" >&2
+  exit 2
+fi
+
+URI=$(security find-generic-password -s "$SERVICE" -w 2>/dev/null || true)
+
+if [ -z "$URI" ] && [ -f "$HOME/.pi/agent/$SERVICE.uri" ]; then
+  URI=$(cat "$HOME/.pi/agent/$SERVICE.uri")
+fi
+
+if [ -z "$URI" ]; then
+  echo "mongo-mcp: URI introuvable (Trousseau '$SERVICE' ou ~/.pi/agent/$SERVICE.uri)" >&2
+  exit 1
+fi
+
+MDB_MCP_CONNECTION_STRING="$URI"
+export MDB_MCP_CONNECTION_STRING
+
+# Serveur MCP installé dans ~/.pi/agent/lib (stable, indépendant du cache npx)
+LOCAL_BIN="$HOME/.pi/agent/lib/node_modules/.bin/mongodb-mcp-server"
+if [ -x "$LOCAL_BIN" ]; then
+  exec "$LOCAL_BIN" "$@"
+fi
+
+exec npx -y "mongodb-mcp-server@<3" "$@"

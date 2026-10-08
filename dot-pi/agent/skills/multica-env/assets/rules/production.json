@@ -1,0 +1,13 @@
+{
+  "required": [
+    "JWT_SECRET",
+    "APP_ENV",
+    "FRONTEND_ORIGIN",
+    "DATABASE_URL"
+  ],
+  "recommended": [
+    "RESEND_API_KEY",
+    "S3_BUCKET",
+    "CLOUDFRONT_DOMAIN"
+  ]
+}

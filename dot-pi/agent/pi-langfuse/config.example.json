@@ -1,0 +1,6 @@
+{
+  "publicKey": "pk-lf-REMPLACE_MOI",
+  "secretKey": "sk-lf-REMPLACE_MOI",
+  "host": "https://cloud.langfuse.com",
+  "privacyPreset": "full-debug"
+}

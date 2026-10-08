@@ -1,0 +1,18 @@
+[
+  {
+    "id": "ag_111",
+    "name": "Code Reviewer",
+    "provider": "ollama",
+    "model": "llama3",
+    "visibility": "workspace",
+    "workspace_id": "ws_abc123"
+  },
+  {
+    "id": "ag_222",
+    "name": "Bug Triage Bot",
+    "provider": "openai",
+    "model": "gpt-4o",
+    "visibility": "private",
+    "workspace_id": "ws_abc123"
+  }
+]

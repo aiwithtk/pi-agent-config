@@ -1,0 +1,9 @@
+{
+  "name": "pi-extensions",
+  "private": true,
+  "dependencies": {
+    "@ollama/pi-web-search": "^0.0.5",
+    "pi-langfuse": "^1.7.0",
+    "pi-mcp-adapter": "^5.1.0"
+  }
+}

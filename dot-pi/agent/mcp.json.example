@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "mongodb": {
+      "command": "~/.pi/agent/bin/mongo-mcp",
+      "args": ["pi-mongod-local-agent"]
+    },
+    "mongodb-atlas": {
+      "command": "~/.pi/agent/bin/mongo-mcp",
+      "args": ["pi-mongodb-atlas"]
+    },
+    "jev": {
+      "url": "https://www.jevai.org/api/mcp",
+      "headers": {
+        "Authorization": "!echo Bearer $(security find-generic-password -s pi-jev-api -a YOUR_MACOS_USER -w)"
+      },
+      "timeout": 30
+    },
+    "treg": {
+      "url": "https://treg.to/mcp/",
+      "headers": {
+        "Authorization": "!echo Bearer $(security find-generic-password -s pi-treg-token -a YOUR_MACOS_USER -w)"
+      }
+    },
+    "n8n-mcp": {
+      "command": "npx",
+      "args": ["n8n-mcp"],
+      "env": {
+        "MCP_MODE": "stdio",
+        "LOG_LEVEL": "error",
+        "DISABLE_CONSOLE_OUTPUT": "true",
+        "N8N_API_URL": "${N8N_API_URL}",
+        "N8N_API_KEY": "${N8N_API_KEY}"
+      }
+    }
+  }
+}

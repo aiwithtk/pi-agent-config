@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+// mongoq — tiny MongoDB query helper for the pi bash tool.
+//
+//   mongoq 'db.listCollections().toArray()' --db heyform
+//   mongoq 'db.forms.countDocuments({})' --db heyform
+//   mongoq 'db.forms.find({},{name:1}).limit(3).toArray()' --db heyform
+//   mongoq --databases
+//   echo '{"a":1}' | mongoq --insert heyform.forms
+//
+// URI resolution: --uri flag > $MONGODB_URI > Trousseau macOS > mongodb://127.0.0.1:27017
+import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import { readdirSync, existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+const require = createRequire(import.meta.url);
+
+// The mongodb driver ships with mongodb-mcp-server (already downloaded by npx).
+function loadDriver() {
+  // emplacement stable (indépendant du cache npx, qui peut être purgé)
+  try { return require(join(homedir(), '.pi', 'agent', 'lib', 'node_modules', 'mongodb')); } catch {}
+  const roots = [join(homedir(), '.npm', '_npx')];
+  for (const root of roots) {
+    if (!existsSync(root)) continue;
+    for (const dir of readdirSync(root)) {
+      const p = join(root, dir, 'node_modules');
+      try { return require(join(p, 'mongodb')); } catch {}
+    }
+  }
+  try { return require('mongodb'); } catch {}
+  console.error('mongodb driver introuvable. Installer : cd ~/.pi/agent/lib && npm install mongodb');
+  process.exit(2);
+}
+const { MongoClient } = loadDriver();
+
+const argv = process.argv.slice(2);
+// mongod local protégé par mot de passe : URI dans le Trousseau macOS (voir skill brain)
+function keychainUri() {
+  for (const service of ['pi-mongod-local-agent', 'pi-mongod-local-admin']) {
+    try {
+      const v = execFileSync('security', ['find-generic-password', '-s', service, '-w'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (v.startsWith('mongodb')) return v;
+    } catch {}
+  }
+  return null;
+}
+let uri = process.env.MONGODB_URI || keychainUri() || 'mongodb://127.0.0.1:27017';
+let dbName = process.env.MONGODB_DB || 'admin';
+let collection = null;
+let mode = 'eval';
+const rest = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === '--uri') uri = argv[++i];
+  else if (a === '--db') dbName = argv[++i];
+  else if (a === '--insert') { mode = 'insert'; collection = argv[++i]; }
+  else if (a === '--databases') mode = 'databases';
+  else if (a === '--collections') mode = 'collections';
+  else rest.push(a);
+}
+
+const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
+const out = (v) => console.log(typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+
+// mongosh-style sugar: db.usermodels.countDocuments({}) -> db.collection('usermodels').countDocuments({}),
+// db.system.users -> db.collection('system.users'), db.runCommand -> db.command
+function sugar(db, path = '') {
+  return new Proxy(function () {}, {
+    get(_, prop) {
+      if (prop === 'then' || typeof prop === 'symbol') return undefined; // not a thenable
+      if (!path) {
+        if (prop === 'runCommand') return (cmd) => db.command(cmd);
+        if (prop in db) {
+          const v = db[prop];
+          return typeof v === 'function' ? v.bind(db) : v;
+        }
+      } else {
+        // parent segment already looks like a collection -> expose its methods
+        const col = db.collection(path);
+        if (prop in col) {
+          const v = col[prop];
+          return typeof v === 'function' ? (...a) => v.apply(col, a) : v;
+        }
+      }
+      return sugar(db, path ? `${path}.${prop}` : prop);
+    },
+    has() { return true; },
+  });
+}
+
+try {
+  await client.connect();
+  if (mode === 'databases') {
+    out((await client.db('admin').admin().listDatabases()).databases
+      .map((d) => `${d.name}  ${(d.sizeOnDisk / 1048576).toFixed(2)} MB`).join('\n'));
+  } else if (mode === 'collections') {
+    const cols = await client.db(dbName).listCollections().toArray();
+    out(cols.map((c) => `${c.name} (${c.type})`).join('\n') || '(aucune collection)');
+  } else if (mode === 'insert') {
+    const [db, col] = collection.includes('.') ? collection.split('.') : [dbName, collection];
+    const raw = rest[0] || readFileSync(0, 'utf8');
+    const docs = JSON.parse(raw);
+    const r = await client.db(db).collection(col).insertMany(Array.isArray(docs) ? docs : [docs]);
+    out({ inserted: r.insertedCount, ids: Object.values(r.insertedIds).map(String) });
+  } else {
+    const code = rest.join(' ') || 'db.stats()';
+    const db = sugar(client.db(dbName));
+    // eslint-disable-next-line no-new-func
+    const fn = new Function('db', 'client', 'uri', `return (async () => (${code}))()`);
+    out(await fn(db, client, uri));
+  }
+} catch (e) {
+  console.error('ERREUR:', e.message);
+  process.exitCode = 1;
+} finally {
+  await client.close();
+}

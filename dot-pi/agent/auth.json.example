@@ -1,0 +1,18 @@
+{
+  "xai": {
+    "type": "api_key",
+    "key": "xai-REMPLACE_MOI"
+  },
+  "deepseek": {
+    "type": "api_key",
+    "key": "sk-REMPLACE_MOI"
+  },
+  "moonshotai": {
+    "type": "api_key",
+    "key": "sk-REMPLACE_MOI"
+  },
+  "zai": {
+    "type": "api_key",
+    "key": "REMPLACE_MOI.id.secret"
+  }
+}

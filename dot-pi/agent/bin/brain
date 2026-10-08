@@ -1,0 +1,662 @@
+#!/usr/bin/env node
+// brain — MongoDB-backed long-term memory for the pi agent.
+//
+//   brain init                      crée collections, validateurs et index (idempotent)
+//   brain digest                    contexte compact à injecter au démarrage d'une session
+//   brain put facts '{"key":"langue","value":"fr"}'
+//   brain add journal '{"kind":"note","text":"..."}'
+//   brain search "atlas stream processing" [--limit 8] [--collection facts]
+//   brain ls tasks --filter '{"status":"doing"}' --limit 20
+//   brain done <taskId>
+//   brain rm <collection> <id>
+//   brain stats | schema
+//
+// URI: --uri > $BRAIN_URI > $MDB_MCP_CONNECTION_STRING > Trousseau macOS > mcp.json
+import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, basename, relative } from 'node:path';
+
+const require = createRequire(import.meta.url);
+function loadDriver() {
+  // emplacement stable (indépendant du cache npx, qui peut être purgé)
+  try { return require(join(homedir(), '.pi', 'agent', 'lib', 'node_modules', 'mongodb')); } catch {}
+  const root = join(homedir(), '.npm', '_npx');
+  if (existsSync(root)) {
+    for (const d of readdirSync(root)) {
+      try { return require(join(root, d, 'node_modules', 'mongodb')); } catch {}
+    }
+  }
+  try { return require('mongodb'); } catch {}
+  console.error('mongodb driver introuvable. Installer : cd ~/.pi/agent/lib && npm install mongodb');
+  process.exit(2);
+}
+const { MongoClient, ObjectId } = loadDriver();
+
+const HOME = homedir();
+const MCP_JSON = join(HOME, '.pi', 'agent', 'mcp.json');
+const KEYCHAIN_SERVICE = 'pi-mongodb-atlas';
+
+// ---------------------------------------------------------------- schema
+const str = (description) => ({ bsonType: 'string', ...(description ? { description } : {}) });
+const arr = (description) => ({ bsonType: 'array', items: { bsonType: 'string' }, ...(description ? { description } : {}) });
+const ts = { bsonType: 'date' };
+const text = (weights) => ({
+  keys: Object.fromEntries(Object.keys(weights).map((f) => [f, 'text'])),
+  options: { name: 'text_search', default_language: 'none', weights },
+});
+
+const SCHEMA = {
+  facts: {
+    doc: 'Vérités durables sur l\'utilisateur, ses préférences et son contexte.',
+    upsertKey: 'key',
+    validator: {
+      bsonType: 'object',
+      required: ['key', 'value', 'updatedAt'],
+      properties: {
+        key: str('identifiant unique, snake_case, ex: "langue_reponse"'),
+        value: str('toujours une chaîne de caractères (stringifier les objets)'),
+        category: { enum: ['preference', 'profil', 'technique', 'pro', 'perso', 'contexte'] },
+        confidence: { enum: ['low', 'medium', 'high'] },
+        source: str('d\'où vient l\'info : "session", "user", "deduction"…'),
+        tags: arr(),
+        createdAt: ts, updatedAt: ts,
+      },
+    },
+    indexes: [
+      { keys: { key: 1 }, options: { unique: true, name: 'key_unique' } },
+      text({ key: 10, value: 4, tags: 6 }),
+      { keys: { category: 1, updatedAt: -1 }, options: { name: 'category_recent' } },
+    ],
+  },
+  projects: {
+    doc: 'Projets en cours ou passés, avec stack et chemins.',
+    upsertKey: 'name',
+    validator: {
+      bsonType: 'object',
+      required: ['name', 'status', 'updatedAt'],
+      properties: {
+        name: str('nom unique du projet'),
+        status: { enum: ['active', 'paused', 'done', 'archived'] },
+        stack: arr(), repo: str(), path: str(),
+        goals: str(), notes: str(), tags: arr(),
+        createdAt: ts, updatedAt: ts,
+      },
+    },
+    indexes: [
+      { keys: { name: 1 }, options: { unique: true, name: 'name_unique' } },
+      text({ name: 10, goals: 3, notes: 3, stack: 2, tags: 5 }),
+      { keys: { status: 1, updatedAt: -1 }, options: { name: 'status_recent' } },
+    ],
+  },
+  people: {
+    doc: 'Personnes, clients, organisations et services récurrents.',
+    upsertKey: 'name',
+    validator: {
+      bsonType: 'object',
+      required: ['name', 'kind', 'updatedAt'],
+      properties: {
+        name: str(), kind: { enum: ['person', 'client', 'org', 'service', 'tool'] },
+        org: str(), contact: str(), notes: str(), tags: arr(),
+        createdAt: ts, updatedAt: ts,
+      },
+    },
+    indexes: [
+      { keys: { name: 1 }, options: { unique: true, name: 'name_unique' } },
+      text({ name: 10, org: 5, notes: 3, tags: 5 }),
+      { keys: { kind: 1 }, options: { name: 'kind' } },
+    ],
+  },
+  tasks: {
+    doc: 'Boucles ouvertes : ce qui reste à faire, avec échéance et priorité.',
+    validator: {
+      bsonType: 'object',
+      required: ['title', 'status', 'createdAt', 'updatedAt'],
+      properties: {
+        title: str(), status: { enum: ['new', 'doing', 'blocked', 'done'] },
+        project: str(), due: { bsonType: ['date', 'null'] },
+        priority: { enum: ['low', 'medium', 'high', 'urgent'] },
+        notes: str(), tags: arr(),
+        createdAt: ts, updatedAt: ts, completedAt: { bsonType: ['date', 'null'] },
+      },
+    },
+    indexes: [
+      text({ title: 10, notes: 3, tags: 5 }),
+      { keys: { status: 1, priority: -1, due: 1 }, options: { name: 'open_tasks' } },
+      { keys: { project: 1, status: 1 }, options: { name: 'project_status' } },
+    ],
+  },
+  decisions: {
+    doc: 'Journal de décisions techniques avec leur rationale (pourquoi ce choix).',
+    validator: {
+      bsonType: 'object',
+      required: ['title', 'decision', 'decidedAt'],
+      properties: {
+        title: str(), context: str(), decision: str(), rationale: str(),
+        alternatives: arr(), project: str(), tags: arr(), decidedAt: ts,
+      },
+    },
+    indexes: [
+      text({ title: 10, decision: 4, rationale: 4, context: 2, tags: 5 }),
+      { keys: { decidedAt: -1 }, options: { name: 'recent' } },
+      { keys: { project: 1 }, options: { name: 'project' } },
+    ],
+  },
+  lessons: {
+    doc: 'Erreurs rencontrées et comment elles ont été résolues — pour ne pas les répéter.',
+    validator: {
+      bsonType: 'object',
+      required: ['problem', 'fix', 'learnedAt'],
+      properties: {
+        problem: str(), cause: str(), fix: str(),
+        project: str(), tags: arr(), learnedAt: ts,
+      },
+    },
+    indexes: [
+      text({ problem: 10, cause: 3, fix: 4, tags: 5 }),
+      { keys: { learnedAt: -1 }, options: { name: 'recent' } },
+      { keys: { project: 1 }, options: { name: 'project' } },
+    ],
+  },
+  journal: {
+    doc: 'Observations horodatées et résumés de session.',
+    validator: {
+      bsonType: 'object',
+      required: ['at', 'kind', 'text'],
+      properties: {
+        at: ts, kind: { enum: ['note', 'observation', 'session', 'idea', 'log'] },
+        text: str(), project: str(), tags: arr(), sessionId: str(),
+      },
+    },
+    indexes: [
+      text({ text: 10, tags: 5 }),
+      { keys: { at: -1 }, options: { name: 'recent' } },
+      { keys: { kind: 1, at: -1 }, options: { name: 'kind_recent' } },
+    ],
+  },
+  sessions: {
+    doc: 'Trace automatique de chaque session de l\'agent (écrite par l\'extension pi mongodb-brain).',
+    upsertKey: 'sessionId',
+    validator: {
+      bsonType: 'object',
+      required: ['sessionId', 'updatedAt'],
+      properties: {
+        sessionId: str('identifiant de session pi'),
+        cwd: str('dossier de travail'),
+        model: str(), provider: str(), reason: str('startup|new|resume|fork'),
+        startedAt: ts, endedAt: ts,
+        durationMs: { bsonType: ['int', 'long', 'double'] },
+        turns: { bsonType: ['int', 'long', 'double'] },
+        tools: str('résumé texte, ex: "bash:12, edit:3"'),
+        files: arr('fichiers touchés'),
+        firstPrompt: str(), lastPrompt: str(),
+        createdAt: ts, updatedAt: ts,
+      },
+    },
+    indexes: [
+      { keys: { sessionId: 1 }, options: { unique: true, name: 'session_unique' } },
+      text({ firstPrompt: 8, lastPrompt: 4, cwd: 3, model: 2 }),
+      { keys: { startedAt: -1 }, options: { name: 'recent' } },
+    ],
+  },
+  transcripts: {
+    doc: 'Contexte brut : une entrée par message (user/assistant/toolResult) extraite des sessions pi. Écrite par `brain ingest`.',
+    noValidator: true,
+    indexes: [
+      { keys: { sessionId: 1, entryId: 1 }, options: { unique: true, name: 'entry_unique' } },
+      text({ text: 10, toolName: 3, project: 2 }),
+      { keys: { ts: -1 }, options: { name: 'recent' } },
+      { keys: { sessionId: 1, ts: 1 }, options: { name: 'session_ts' } },
+      { keys: { file: 1 }, options: { name: 'file' } },
+    ],
+  },
+  snippets: {
+    doc: 'Commandes, configs et bouts de code réutilisables.',
+    upsertKey: 'name',
+    validator: {
+      bsonType: 'object',
+      required: ['name', 'code', 'updatedAt'],
+      properties: {
+        name: str(), lang: str(), code: str(), description: str(), tags: arr(),
+        createdAt: ts, updatedAt: ts,
+      },
+    },
+    indexes: [
+      { keys: { name: 1 }, options: { unique: true, name: 'name_unique' } },
+      text({ name: 10, description: 4, code: 2, tags: 5 }),
+      { keys: { lang: 1 }, options: { name: 'lang' } },
+    ],
+  },
+};
+
+const NOW_FIELD = { lessons: 'learnedAt', decisions: 'decidedAt', journal: 'at' };
+const UPSERT_ONLY = ['facts', 'projects', 'people', 'snippets', 'sessions'];
+// champs de type date à convertir depuis une chaîne ISO (les validateurs exigent un bson date)
+const DATE_FIELDS = { sessions: ['startedAt', 'endedAt'] };
+const coerceDates = (coll, doc) => {
+  for (const f of DATE_FIELDS[coll] || []) {
+    if (typeof doc[f] === 'string') doc[f] = new Date(doc[f]);
+  }
+  return doc;
+};
+
+// ---------------------------------------------------------------- uri
+function keychainUri() {
+  try {
+    const v = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (v.startsWith('mongodb://') || v.startsWith('mongodb+srv://')) return v;
+  } catch {}
+  return null;
+}
+function mcpJsonUri() {
+  try {
+    const cfg = JSON.parse(readFileSync(MCP_JSON, 'utf8'));
+    const uri = cfg?.mcpServers?.['mongodb-atlas']?.env?.MDB_MCP_CONNECTION_STRING;
+    if (uri) return uri;
+  } catch {}
+  return null;
+}
+function resolveUri(flagUri) {
+  const uri = flagUri
+    || process.env.BRAIN_URI
+    || keychainUri()          // Trousseau macOS (source de vérité pour le cerveau)
+    || process.env.MDB_MCP_CONNECTION_STRING
+    || mcpJsonUri()
+    || 'mongodb://127.0.0.1:27017';
+  return uri;
+}
+
+// ---------------------------------------------------------------- args
+const argv = process.argv.slice(2);
+const flags = {};
+const pos = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith('--')) {
+    const k = a.slice(2);
+    const next = argv[i + 1];
+    if (next !== undefined && !next.startsWith('--')) { flags[k] = next; i++; }
+    else flags[k] = true;
+  } else pos.push(a);
+}
+const cmd = pos[0];
+const dbName = flags.db || process.env.BRAIN_DB || 'brain';
+const out = (v) => console.log(typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+const parseJson = (s, what) => {
+  try { return JSON.parse(s); } catch { console.error(`JSON invalide pour ${what}: ${s}`); process.exit(2); }
+};
+const idOf = (v) => (ObjectId.isValid(v) ? new ObjectId(v) : v);
+
+// ---------------------------------------------------------------- commands
+async function init(db) {
+  const existing = new Map((await db.listCollections().toArray()).map((c) => [c.name, c]));
+  const created = [], indexed = [], warnings = [];
+  for (const [name, def] of Object.entries(SCHEMA)) {
+    const validator = { $jsonSchema: def.validator };
+    if (!existing.has(name)) {
+      const opts = def.noValidator
+        ? {}
+        : { validator, validationLevel: 'moderate', validationAction: 'error' };
+      await db.createCollection(name, opts);
+      created.push(name);
+    } else if (!def.noValidator && JSON.stringify(existing.get(name).options?.validator) !== JSON.stringify(validator)) {
+      // collMod demande des droits dbAdmin : on signale au lieu d'échouer
+      try {
+        await db.command({ collMod: name, validator, validationLevel: 'moderate' });
+      } catch (e) {
+        warnings.push(`validateur de ${name} non mis à jour (${e.message.split('\n')[0].slice(0, 80)})`);
+      }
+    }
+    const have = new Set((await db.collection(name).indexes()).map((i) => i.name));
+    for (const idx of def.indexes) {
+      const idxName = idx.options?.name || JSON.stringify(idx.keys);
+      if (have.has(idxName)) continue;
+      try {
+        await db.collection(name).createIndex(idx.keys, idx.options || {});
+        indexed.push(`${name}.${idxName}`);
+      } catch (e) {
+        warnings.push(`${name}.${idxName} : ${e.message.split('\n')[0].slice(0, 80)}`);
+      }
+    }
+  }
+  return {
+    database: db.databaseName,
+    collections_created: created,
+    indexes_created: indexed,
+    total_collections: Object.keys(SCHEMA).length,
+    ...(warnings.length ? { warnings } : {}),
+  };
+}
+
+async function put(db, coll, doc) {
+  const def = SCHEMA[coll];
+  if (!def) { console.error(`collection inconnue: ${coll} (voir "brain schema")`); process.exit(2); }
+  const key = def.upsertKey;
+  if (!key || doc[key] === undefined) { console.error(`${coll} nécessite le champ "${key}" pour un upsert`); process.exit(2); }
+  coerceDates(coll, doc);
+  const now = new Date();
+  if (typeof doc.value === 'object' && doc.value !== null) doc.value = JSON.stringify(doc.value);
+  const set = { ...doc, updatedAt: now };
+  const setOnInsert = UPSERT_ONLY.includes(coll) ? { createdAt: now } : {};
+  const r = await db.collection(coll).findOneAndUpdate({ [key]: doc[key] }, { $set: set, $setOnInsert: setOnInsert },
+    { upsert: true, returnDocument: 'after' });
+  // createdAt === updatedAt ⇒ le document vient d'être créé (upsert)
+  const created = r?.createdAt instanceof Date && r.createdAt.getTime() === now.getTime();
+  return { ok: true, collection: coll, [key]: doc[key], _id: String(r._id), created, ...(flags.full ? { doc: r } : {}) };
+}
+
+async function add(db, coll, doc) {
+  const now = new Date();
+  const f = NOW_FIELD[coll];
+  coerceDates(coll, doc);
+  const payload = { ...doc };
+  if (f) payload[f] = payload[f] ? new Date(payload[f]) : now;
+  if (['facts', 'projects', 'people', 'snippets', 'tasks'].includes(coll)) {
+    payload.createdAt = now; payload.updatedAt = now;
+  }
+  if (coll === 'tasks') {
+    payload.status = payload.status || 'new';
+    payload.due = payload.due ? new Date(payload.due) : null;
+    payload.completedAt = null;
+  }
+  if (coll === 'projects') payload.status = payload.status || 'active';
+  if (coll === 'people') payload.kind = payload.kind || 'person';
+  if (coll === 'journal' && !payload.kind) payload.kind = 'note';
+  if (typeof payload.value === 'object' && payload.value !== null) payload.value = JSON.stringify(payload.value);
+  const r = await db.collection(coll).insertOne(payload);
+  return { ok: true, collection: coll, _id: String(r.insertedId) };
+}
+
+async function search(db, query, limit, only) {
+  const targets = only ? [only] : Object.keys(SCHEMA);
+  const results = [];
+  for (const coll of targets) {
+    const def = SCHEMA[coll];
+    if (!def?.indexes.some((i) => i.options?.name === 'text_search')) continue;
+    try {
+      const docs = await db.collection(coll).find({ $text: { $search: query } },
+        { projection: { score: { $meta: 'textScore' } } })
+        .sort({ score: { $meta: 'textScore' } }).limit(limit).toArray();
+      for (const d of docs) results.push({ collection: coll, score: Number(d.score?.toFixed?.(2) ?? d.score), doc: d });
+    } catch (e) { results.push({ collection: coll, error: e.message.slice(0, 120) }); }
+  }
+  return results.sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, limit);
+}
+
+async function ls(db, coll, limit, filter, sort) {
+  const q = filter ? parseJson(filter, '--filter') : {};
+  const s = sort ? parseJson(sort, '--sort') : { _id: -1 };
+  return db.collection(coll).find(q).sort(s).limit(limit).toArray();
+}
+
+async function digest(db, maxChars) {
+  const L = [];
+  const facts = await db.collection('facts').find({}).sort({ key: 1 }).toArray();
+  if (facts.length) {
+    L.push('## Faits durables');
+    for (const f of facts) L.push(`- ${f.key} = ${f.value}${f.category ? ` (${f.category}${f.confidence ? `, ${f.confidence}` : ''})` : ''}`);
+  }
+  const projects = await db.collection('projects').find({ status: { $in: ['active', 'paused'] } }).sort({ updatedAt: -1 }).toArray();
+  if (projects.length) {
+    L.push('\n## Projets');
+    for (const p of projects) L.push(`- **${p.name}** [${p.status}]${p.stack?.length ? ` — ${p.stack.join(', ')}` : ''}${p.path ? ` — ${p.path}` : ''}${p.goals ? `\n  objectif : ${p.goals}` : ''}${p.notes ? `\n  notes : ${p.notes}` : ''}`);
+  }
+  const tasks = await db.collection('tasks').find({ status: { $in: ['new', 'doing', 'blocked'] } })
+    .sort({ priority: -1, due: 1, createdAt: 1 }).limit(30).toArray();
+  if (tasks.length) {
+    L.push('\n## Tâches ouvertes');
+    for (const t of tasks) L.push(`- [${t.status}] ${t.title}${t.project ? ` — ${t.project}` : ''}${t.priority ? ` (${t.priority})` : ''}${t.due ? ` échéance ${new Date(t.due).toISOString().slice(0, 10)}` : ''} (id ${t._id})`);
+  }
+  const decisions = await db.collection('decisions').find({}).sort({ decidedAt: -1 }).limit(6).toArray();
+  if (decisions.length) {
+    L.push('\n## Décisions récentes');
+    for (const d of decisions) L.push(`- ${d.title} → ${d.decision}${d.rationale ? ` (car ${d.rationale})` : ''}`);
+  }
+  const lessons = await db.collection('lessons').find({}).sort({ learnedAt: -1 }).limit(8).toArray();
+  if (lessons.length) {
+    L.push('\n## Leçons apprises');
+    for (const l of lessons) L.push(`- ${l.problem} → ${l.fix}${l.cause ? ` (cause : ${l.cause})` : ''}`);
+  }
+  const sessions = await db.collection('sessions').find({ turns: { $gt: 0 } }).sort({ startedAt: -1 }).limit(3).toArray();
+  if (sessions.length) {
+    L.push('\n## Sessions récentes');
+    for (const s of sessions) {
+      const when = new Date(s.startedAt || s.updatedAt).toISOString().slice(0, 16).replace('T', ' ');
+      const where = String(s.cwd || '').split('/').filter(Boolean).pop() || '?';
+      // le premier message peut être un prompt système multiligne : on l'aplatit et on le coupe
+      const what = String(s.firstPrompt || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+      L.push(`- ${when} · ${where}${what ? ` — ${what}` : ''}`);
+    }
+  }
+  const journal = await db.collection('journal').find({}).sort({ at: -1 }).limit(5).toArray();
+  if (journal.length) {
+    L.push('\n## Journal récent');
+    for (const j of journal) L.push(`- ${new Date(j.at).toISOString().slice(0, 16)} [${j.kind}] ${j.text}`);
+  }
+  const people = await db.collection('people').find({}).sort({ updatedAt: -1 }).limit(15).toArray();
+  if (people.length) {
+    L.push('\n## Personnes / services');
+    for (const p of people) L.push(`- ${p.name} (${p.kind})${p.org ? ` — ${p.org}` : ''}${p.notes ? ` — ${p.notes}` : ''}`);
+  }
+  const snippets = await db.collection('snippets').find({}).sort({ updatedAt: -1 }).limit(12).toArray();
+  if (snippets.length) {
+    L.push('\n## Snippets');
+    for (const s of snippets) L.push(`- ${s.name}${s.description ? ` — ${s.description}` : ''}${s.lang ? ` [${s.lang}]` : ''}`);
+  }
+  let text = L.join('\n');
+  if (maxChars && text.length > maxChars) text = text.slice(0, maxChars) + '\n… (digest tronqué, utilise `brain search`)';
+  return text || '(cerveau vide — rien de mémorisé pour l\'instant)';
+}
+
+// ---------------------------------------------------------------- ingest (contexte brut)
+const SESSIONS_DIR = join(HOME, '.pi', 'agent', 'sessions');
+const MAX_TEXT = 20000;
+const MAX_THINKING = 3000;
+const MAX_ARGS = 3000;
+let SECRETS_CACHE = null;
+
+function secretsToRedact() {
+  if (SECRETS_CACHE) return SECRETS_CACHE;
+  const found = new Set();
+  const add = (v) => {
+    if (typeof v !== 'string' || v.length < 8) return;
+    found.add(v);
+    const m = v.match(/:\/\/[^:/]+:([^@]+)@/);   // mot de passe dans une URI
+    if (m && m[1] && m[1].length >= 8) found.add(m[1]);
+  };
+  try {
+    const cfg = JSON.parse(readFileSync(MCP_JSON, 'utf8'));
+    for (const srv of Object.values(cfg.mcpServers || {})) {
+      for (const [k, v] of Object.entries(srv.env || {})) {
+        if (/KEY|TOKEN|SECRET|PASSWORD|URI|STRING/i.test(k)) add(v);
+      }
+    }
+  } catch {}
+  for (const svc of ['pi-mongodb-atlas', 'pi-mongod-local-admin', 'pi-mongod-local-agent']) {
+    try {
+      add(execFileSync('security', ['find-generic-password', '-s', svc, '-w'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
+    } catch {}
+  }
+  SECRETS_CACHE = [...found].sort((a, b) => b.length - a.length);
+  return SECRETS_CACHE;
+}
+
+const REDACT_PATTERNS = [
+  [/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, '<JWT-REDACTED>'],
+  [/(mongodb(?:\+srv)?:\/\/[^:/\s"']+:)[^@/\s"']+(@)/g, '$1<REDACTED>$2'],
+  [/\b(?:sk|pk|ghp|gho|ghs|glpat|xox[baprs])[-_][A-Za-z0-9_-]{16,}\b/g, '<TOKEN-REDACTED>'],
+  [/\bAKIA[0-9A-Z]{16}\b/g, '<AWS-KEY-REDACTED>'],
+];
+
+function redact(value) {
+  if (typeof value !== 'string' || !value) return value;
+  let out = value;
+  for (const s of secretsToRedact()) out = out.split(s).join('<REDACTED>');
+  for (const [re, rep] of REDACT_PATTERNS) out = out.replace(re, rep);
+  return out;
+}
+
+const clip = (s, n) => (typeof s === 'string' && s.length > n ? `${s.slice(0, n)}\n…[tronqué ${s.length - n} caractères]` : s);
+const projectOf = (cwd) => String(cwd || '').split('/').filter(Boolean).pop() || 'inconnu';
+
+function walkJsonl(dir, acc = []) {
+  let items = [];
+  try { items = readdirSync(dir, { withFileTypes: true }); } catch { return acc; }
+  for (const it of items) {
+    const full = join(dir, it.name);
+    if (it.isDirectory()) walkJsonl(full, acc);
+    else if (it.name.endsWith('.jsonl')) acc.push(full);
+  }
+  return acc;
+}
+
+function parseSessionFile(file) {
+  const rel = relative(SESSIONS_DIR, file);
+  const mtime = statSync(file).mtime;
+  const entries = [];
+  for (const line of readFileSync(file, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try { entries.push(JSON.parse(line)); } catch {}
+  }
+  const meta = entries.find((e) => e.type === 'session') || {};
+  const sessionId = meta.id || basename(file).replace(/\.jsonl$/, '');
+  const cwd = meta.cwd || null;
+  const project = projectOf(cwd);
+  const fallbackTs = new Date(basename(file).slice(0, 24).replace(/-/g, (m, i) => (i === 10 || i === 13 || i === 16 ? ':' : m)) || Date.now());
+  const docs = [];
+
+  for (const o of entries) {
+    if (o.type !== 'message' || !o.message) continue;
+    const m = o.message;
+    const role = m.role;
+    if (!['user', 'assistant', 'toolResult'].includes(role)) continue;
+    const content = Array.isArray(m.content) ? m.content : [];
+    const doc = {
+      sessionId,
+      file: rel,
+      project,
+      cwd,
+      entryId: o.id,
+      parentId: o.parentId || null,
+      ts: new Date(m.timestamp || o.timestamp || fallbackTs),
+      role,
+      ingestedAt: new Date(),
+    };
+    if (role === 'user' || role === 'assistant') {
+      const textParts = content.filter((c) => c.type === 'text' && c.text).map((c) => c.text);
+      const thinkParts = content.filter((c) => c.type === 'thinking' && c.thinking).map((c) => c.thinking);
+      const calls = content.filter((c) => c.type === 'toolCall');
+      if (textParts.length) doc.text = clip(redact(textParts.join('\n\n')), MAX_TEXT);
+      if (thinkParts.length) doc.thinking = clip(redact(thinkParts.join('\n\n')), MAX_THINKING);
+      if (calls.length) doc.toolCalls = calls.map((c) => ({
+        name: c.name,
+        args: clip(redact(typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {})), MAX_ARGS),
+      }));
+      if (m.model) doc.model = m.model;
+      if (m.provider) doc.provider = m.provider;
+      if (m.usage) doc.usage = { input: m.usage.inputTokens ?? m.usage.input ?? null, output: m.usage.outputTokens ?? m.usage.output ?? null, cost: m.usage.cost ?? null };
+    } else {
+      doc.toolName = m.toolName || null;
+      doc.toolCallId = m.toolCallId || null;
+      doc.isError = !!m.isError;
+      const textParts = content.filter((c) => c.type === 'text' && c.text).map((c) => c.text);
+      if (textParts.length) doc.text = clip(redact(textParts.join('\n\n')), MAX_TEXT);
+    }
+    if (!doc.text && !doc.toolCalls) continue;   // rien d'exploitable (thinking seul sur une entrée vide)
+    docs.push(doc);
+  }
+  return { sessionId, cwd, project, file: rel, mtime, docs };
+}
+
+async function ingest(db, opts = {}) {
+  const dir = opts.dir || SESSIONS_DIR;
+  const force = !!opts.force;
+  const files = walkJsonl(dir);
+  const marks = await db.collection('transcripts')
+    .aggregate([{ $group: { _id: '$file', last: { $max: '$ingestedAt' } } }]).toArray();
+  const lastByFile = new Map(marks.map((m) => [m._id, new Date(m.last).getTime()]));
+
+  let written = 0, skipped = 0, messages = 0;
+  const sessions = new Set();
+  for (const file of files) {
+    const rel = relative(SESSIONS_DIR, file);
+    const mtime = statSync(file).mtimeMs;
+    if (!force && (lastByFile.get(rel) || 0) >= mtime) { skipped++; continue; }
+    const { sessionId, docs } = parseSessionFile(file);
+    sessions.add(sessionId);
+    for (let i = 0; i < docs.length; i += 400) {
+      const batch = docs.slice(i, i + 400);
+      const r = await db.collection('transcripts').bulkWrite(batch.map((d) => ({
+        updateOne: { filter: { sessionId: d.sessionId, entryId: d.entryId }, update: { $set: d }, upsert: true },
+      })), { ordered: false });
+      written += (r.upsertedCount || 0) + (r.modifiedCount || 0);
+      messages += batch.length;
+    }
+  }
+  return {
+    database: db.databaseName,
+    files_scanned: files.length,
+    files_ingested: files.length - skipped,
+    files_skipped_unchanged: skipped,
+    sessions: sessions.size,
+    documents_written: written,
+    secrets_redacted: secretsToRedact().length,
+  };
+}
+
+// ---------------------------------------------------------------- main
+const uri = resolveUri(flags.uri);
+const client = new MongoClient(uri, { serverSelectionTimeoutMS: 8000 });
+try {
+  await client.connect();
+  const db = client.db(dbName);
+  if (cmd === 'init') out(await init(db));
+  else if (cmd === 'digest') {
+    const text = await digest(db, Number(flags.max) || 6000);
+    out(flags.json ? { text } : text);
+  }
+  else if (cmd === 'put') out(await put(db, pos[1], parseJson(pos[2], 'doc')));
+  else if (cmd === 'add') out(await add(db, pos[1], parseJson(pos[2], 'doc')));
+  else if (cmd === 'ingest') out(await ingest(db, { force: !!flags.force, dir: flags.dir }));
+  else if (cmd === 'search') out(await search(db, pos.slice(1).join(' '), Number(flags.limit) || 8, flags.collection));
+  else if (cmd === 'ls') out(await ls(db, pos[1], Number(flags.limit) || 25, flags.filter, flags.sort));
+  else if (cmd === 'get') out(await db.collection(pos[1]).findOne({ _id: idOf(pos[2]) }));
+  else if (cmd === 'rm') out(await db.collection(pos[1]).deleteOne({ _id: idOf(pos[2]) }));
+  else if (cmd === 'done') out(await db.collection('tasks').findOneAndUpdate({ _id: idOf(pos[1]) },
+    { $set: { status: 'done', completedAt: new Date(), updatedAt: new Date() } }, { returnDocument: 'after' }));
+  else if (cmd === 'stats') {
+    const cols = (await db.listCollections().toArray()).map((c) => c.name).sort();
+    const res = {};
+    for (const c of cols) res[c] = await db.collection(c).countDocuments();
+    out({ database: db.databaseName, counts: res, total: Object.values(res).reduce((a, b) => a + b, 0) });
+  }
+  else if (cmd === 'schema') {
+    out(Object.fromEntries(Object.entries(SCHEMA).map(([k, v]) => [k, {
+      doc: v.doc, upsert_key: v.upsertKey || null, required: v.validator.required,
+      fields: Object.keys(v.validator.properties), indexes: v.indexes.map((i) => i.options?.name),
+    }])));
+  }
+  else {
+    out(`brain — mémoire long terme sur MongoDB (db: ${dbName})
+
+  brain init                                 crée/actualise collections, validateurs, index
+  brain digest [--max 6000] [--json]         contexte compact pour le démarrage de session
+  brain put   <coll> '<json>'                upsert par clé (facts, projects, people, snippets)
+  brain add   <coll> '<json>'                insertion (tasks, decisions, lessons, journal)
+  brain ls    <coll> [--filter '<json>'] [--limit 25] [--sort '<json>']
+  brain ingest [--force] [--dir <path>]     ingère le contexte des sessions pi dans la collection transcripts
+  brain search "<texte>" [--limit 8] [--collection facts]
+  brain get   <coll> <id> | brain rm <coll> <id> | brain done <taskId>
+  brain stats | brain schema
+
+Collections : ${Object.keys(SCHEMA).join(', ')}`);
+  }
+} catch (e) {
+  console.error('ERREUR:', e.message.split('\n')[0]);
+  process.exitCode = 1;
+} finally {
+  await client.close();
+}

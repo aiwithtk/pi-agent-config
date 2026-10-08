@@ -1,0 +1,26 @@
+[
+  {
+    "id": "rt_ollama_llama3",
+    "name": "Llama3 (Ollama)",
+    "tool": "ollama",
+    "model": "llama3",
+    "status": "online",
+    "last_heartbeat": "2026-05-13T12:45:22Z"
+  },
+  {
+    "id": "rt_openai_gpt4o",
+    "name": "GPT-4o (OpenAI)",
+    "tool": "openai",
+    "model": "gpt-4o",
+    "status": "online",
+    "last_heartbeat": "2026-05-13T12:44:18Z"
+  },
+  {
+    "id": "rt_gemini_25",
+    "name": "Gemini 2.5 (Google)",
+    "tool": "gemini",
+    "model": "gemini-2.5-pro",
+    "status": "offline",
+    "last_heartbeat": "2026-05-12T09:11:03Z"
+  }
+]
